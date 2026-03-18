@@ -1,0 +1,151 @@
+import std::math;
+import std::random;
+
+processor Staccatone_SoulTaker_P7_Poly [[ name: "Staccatone SoulTaker P7 Poly Extreme", description: "8-voice poly: 1923 Hartley sine → extreme mu squash (8 default), 64x coarse bit-crush, tanh tube glow, per-voice HP-shaped NJAD dither. MIDI poly ready." ]]
+{
+    output stream float out;
+
+    // Shared parameters (knobs in Amorph UI)
+    input event float inputGain  [[ name: "Input Gain", min: 0.1f, max: 6.0f, init: 2.0f, step: 0.1f, group: "Drive" ]];
+    input event float muIntensity [[ name: "Pressure 7 Intensity", min: 6.0f, max: 12.0f, init: 8.0f, step: 0.2f, group: "SoulTaker" ]];
+    input event float shiftBits  [[ name: "Bit Crush Shift (log2)", min: 4.0f, max: 10.0f, init: 6.0f, step: 0.5f, group: "BitShift" ]];
+    input event bool  ditherOn   [[ name: "High-Pass NJAD Dither", init: true, group: "Quantization" ]];
+    input event float decayMult  [[ name: "Decay Multiplier", min: 0.95f, max: 0.999f, init: 0.982f, step: 0.001f, group: "Envelope" ]]; // ~80-120ms decay
+
+    // MIDI events (Amorph sends these)
+    input event float noteOn   [[ name: "Note On (MIDI note 0-127)", min: 0.0f, max: 127.0f ]];
+    input event float noteOff  [[ name: "Note Off (MIDI note)", min: 0.0f, max: 127.0f ]];
+    input event float velocity [[ name: "Velocity (0-1)", min: 0.0f, max: 1.0f, init: 1.0f ]];
+
+    // Voice struct – independent state per note
+    struct Voice {
+        float phase = 0.0f;
+        float envelope = 0.0f;
+        float ditherError = 0.0f;
+        float hpErrorState = 0.0f;
+        float currentFreq = 0.0f;
+        float velAmp = 1.0f;
+        bool  active = false;
+        int   age = 0;          // for oldest-note stealing
+    };
+
+    let numVoices = 8;
+    Voice voices[numVoices];
+
+    // Shared state
+    float currentMu = 8.0f;
+    float currentShift = 64.0f;
+    bool currentDither = true;
+    float currentInputGain = 2.0f;
+    float currentDecay = 0.982f;
+
+    let bitBoundary = 8388608.0f;  // 2^23 for 24-bit
+    let hpCoeff = 0.85f;
+
+    // Events
+    event noteOn (float midiNote)
+    {
+        if (midiNote < 0.0f || midiNote > 127.0f) return;
+
+        float freq = 440.0f * pow(2.0f, (midiNote - 69.0f) / 12.0f);
+
+        // Find free or oldest voice
+        int best = -1;
+        int maxAge = -1;
+        for (int i = 0; i < numVoices; ++i)
+        {
+            if (!voices[i].active)
+            {
+                best = i;
+                break;
+            }
+            if (voices[i].age > maxAge)
+            {
+                maxAge = voices[i].age;
+                best = i;
+            }
+        }
+
+        if (best >= 0)
+        {
+            voices[best].currentFreq = freq;
+            voices[best].phase = 0.0f;               // hard retrigger
+            voices[best].envelope = 1.0f;
+            voices[best].velAmp = velocity * 0.8f + 0.2f;  // soft vel response
+            voices[best].ditherError = 0.0f;
+            voices[best].hpErrorState = 0.0f;
+            voices[best].active = true;
+            voices[best].age = 0;
+        }
+    }
+
+    event noteOff (float midiNote) { /* decay naturally - no hard kill */ }
+
+    event inputGain (float g)     { currentInputGain = g; }
+    event muIntensity (float m)   { currentMu = m; }
+    event shiftBits (float bits)  { currentShift = pow(2.0f, bits); }
+    event ditherOn (bool on)      { currentDither = on; }
+    event decayMult (float dm)    { currentDecay = dm; }
+
+    void main()
+    {
+        loop
+        {
+            float mix = 0.0f;
+            int activeCount = 0;
+
+            for (int i = 0; i < numVoices; ++i)
+            {
+                ref let v = voices[i];
+                if (!v.active || v.envelope < 0.0005f)
+                {
+                    v.active = false;
+                    continue;
+                }
+
+                activeCount++;
+
+                // Per-voice oscillator + chain
+                v.phase += 2.0f * float.pi * v.currentFreq / samplerate;
+                if (v.phase > 2.0f * float.pi) v.phase -= 2.0f * float.pi;
+                float sine = sin(v.phase);
+
+                float sig = sine * currentInputGain * v.velAmp * v.envelope;
+
+                sig /= currentShift;
+
+                float squash = 1.0f / (1.0f + (sig * sig * currentMu));
+                sig *= squash;
+
+                sig = tanh(sig * 2.5f);
+
+                float restored = sig * currentShift;
+
+                float final = restored;
+                if (currentDither)
+                {
+                    float withError = restored + v.ditherError;
+                    final = floor(withError * bitBoundary + 0.5f) / bitBoundary;
+                    float rawError = withError - final;
+                    v.hpErrorState = hpCoeff * v.hpErrorState + (1.0f - hpCoeff) * rawError;
+                    v.ditherError = v.hpErrorState;
+                }
+
+                mix += final * 0.88f;
+
+                // Decay envelope per voice
+                v.envelope *= currentDecay;
+
+                v.age++;
+            }
+
+            // Normalize by active voices to avoid level jumps
+            if (activeCount > 0)
+                mix /= float(activeCount);
+
+            out <- mix;
+
+            advance();
+        }
+    }
+}
